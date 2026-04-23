@@ -21,17 +21,20 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import opennlp.tools.commons.ThreadSafe;
+
 /**
  * This {@link AdaptiveFeatureGenerator} generates features indicating the
  * outcome associated with a previously occurring word.
  */
+@ThreadSafe
 public class PreviousMapFeatureGenerator implements AdaptiveFeatureGenerator {
 
-  private final Map<String, String> previousMap = new HashMap<>();
+  private final ThreadLocal<Map<String, String>> threadState = ThreadLocal.withInitial(HashMap::new);
 
   @Override
   public void createFeatures(List<String> features, String[] tokens, int index, String[] preds) {
-    features.add("pd=" + previousMap.get(tokens[index]));
+    features.add("pd=" + threadState.get().get(tokens[index]));
   }
 
   /**
@@ -42,6 +45,7 @@ public class PreviousMapFeatureGenerator implements AdaptiveFeatureGenerator {
    */
   @Override
   public void updateAdaptiveData(String[] tokens, String[] outcomes) {
+    Map<String, String> previousMap = threadState.get();
     for (int i = 0; i < tokens.length; i++) {
       previousMap.put(tokens[i], outcomes[i]);
     }
@@ -49,6 +53,6 @@ public class PreviousMapFeatureGenerator implements AdaptiveFeatureGenerator {
   
   @Override
   public void clearAdaptiveData() {
-    previousMap.clear();
+    threadState.get().clear();
   }
 }

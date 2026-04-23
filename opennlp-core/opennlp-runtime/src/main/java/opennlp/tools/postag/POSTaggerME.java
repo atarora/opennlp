@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import opennlp.tools.commons.ThreadSafe;
 import opennlp.tools.dictionary.Dictionary;
 import opennlp.tools.ml.BeamSearch;
 import opennlp.tools.ml.EventModelSequenceTrainer;
@@ -43,6 +44,7 @@ import opennlp.tools.ml.model.SequenceClassificationModel;
 import opennlp.tools.models.ModelType;
 import opennlp.tools.ngram.NGramModel;
 import opennlp.tools.util.DownloadUtil;
+import opennlp.tools.util.LastResultOwnerOrThreadLocal;
 import opennlp.tools.util.ObjectStream;
 import opennlp.tools.util.Sequence;
 import opennlp.tools.util.SequenceValidator;
@@ -56,12 +58,22 @@ import opennlp.tools.util.featuregen.StringPattern;
  * <p>
  * Tries to predict whether words are nouns, verbs, or any other {@link POSTagFormat POS tags}
  * depending on their surrounding context.
+ * <p>
+ * A POS tagger instance is thread-safe. One instance can be shared across multiple threads to save both
+ * memory and model load time (loading a {@link POSModel} is the dominant startup cost; sharing one tagger
+ * avoids paying it per-thread).
+ * <p>
+ * <b>Note:</b> Thread safety uses {@link LastResultOwnerOrThreadLocal} (and related patterns elsewhere) so
+ * {@code probs()} sees per-thread last results without pinning unnecessary {@link ThreadLocal} entries for
+ * single-threaded short-lived instances. In container environments with classloader isolation (e.g. Jakarta
+ * EE), ensure instances do not outlive the application's lifecycle.
  *
  * @see POSModel
  * @see POSTagFormat
  * @see POSTagger
  * @see Probabilistic
  */
+@ThreadSafe
 public class POSTaggerME implements POSTagger, Probabilistic {
 
   private static final Logger logger = LoggerFactory.getLogger(POSTaggerME.class);
@@ -88,7 +100,12 @@ public class POSTaggerME implements POSTagger, Probabilistic {
    */
   protected final int size;
 
-  private Sequence bestSequence;
+  /**
+   * Last decoded sequence for {@link #probs()} / {@link #probs(double[])} (see
+   * {@link LastResultOwnerOrThreadLocal}).
+   */
+  private final LastResultOwnerOrThreadLocal<Sequence> lastDecodedSequence =
+      new LastResultOwnerOrThreadLocal<>();
 
   private final SequenceClassificationModel model;
 
@@ -99,8 +116,7 @@ public class POSTaggerME implements POSTagger, Probabilistic {
   protected final POSTagFormatMapper posTagFormatMapper;
 
   /**
-   * Initializes a {@link POSTaggerME} by downloading a default model for a given
-   * {@code language}.
+   * Initializes a {@link POSTaggerME} by downloading a default model for a given {@code language}.
    *
    * @param language An ISO conform language code.
    * @throws IOException Thrown if the model could not be downloaded or saved.
@@ -110,8 +126,7 @@ public class POSTaggerME implements POSTagger, Probabilistic {
   }
 
   /**
-   * Initializes a {@link POSTaggerME} by downloading a default model for a given
-   * {@code language}.
+   * Initializes a {@link POSTaggerME} by downloading a default model for a given {@code language}.
    *
    * @param language An ISO conform language code.
    * @param format   A valid {@link POSTagFormat}.
@@ -137,6 +152,26 @@ public class POSTaggerME implements POSTagger, Probabilistic {
    * @param format A valid {@link POSTagFormat}.
    */
   public POSTaggerME(POSModel model, POSTagFormat format) {
+    this(model, format, -1);
+  }
+
+  /**
+   * Initializes a {@link POSTaggerME} with the provided {@link POSModel model} and explicit cache
+   * configuration.
+   *
+   * @param model  A valid {@link POSModel}.
+   * @param format A valid {@link POSTagFormat}.
+   * @param contextCacheSize size of the per-thread context generator cache. Use {@code 0} to disable caching,
+   *     {@code -1} for the default (beam size), or a non-negative value; values less than {@code -1} are
+   *     not allowed.
+   */
+  public POSTaggerME(POSModel model, POSTagFormat format,
+      int contextCacheSize) {
+    if (contextCacheSize < -1) {
+      throw new IllegalArgumentException("contextCacheSize must be >= -1: "
+          + "use -1 for the default (beam-sized) cache, or a non-negative value "
+          + "(0 disables caching).");
+    }
     this.posTagFormat = format;
     POSTaggerFactory factory = model.getFactory();
 
@@ -150,7 +185,8 @@ public class POSTaggerME implements POSTagger, Probabilistic {
 
     modelPackage = model;
 
-    cg = factory.getPOSContextGenerator(beamSize);
+    int cacheSize = contextCacheSize >= 0 ? contextCacheSize : beamSize;
+    cg = factory.getPOSContextGenerator(cacheSize);
     tagDictionary = factory.getTagDictionary();
     size = beamSize;
 
@@ -162,10 +198,8 @@ public class POSTaggerME implements POSTagger, Probabilistic {
       this.model = new BeamSearch(beamSize, model.getArtifact(POSModel.POS_MODEL_ENTRY_NAME), 0);
     }
 
-    this.posTagFormatMapper = (format == POSTagFormat.CUSTOM)
-        ? new POSTagFormatMapper.NoOp()
+    this.posTagFormatMapper = (format == POSTagFormat.CUSTOM) ? new POSTagFormatMapper.NoOp()
         : new POSTagFormatMapper(getAllPosTags());
-
   }
 
   /**
@@ -188,8 +222,12 @@ public class POSTaggerME implements POSTagger, Probabilistic {
    */
   @Override
   public String[] tag(String[] sentence, Object[] additionalContext) {
-    bestSequence = model.bestSequence(sentence, additionalContext, cg, sequenceValidator);
-    final List<String> t = bestSequence.getOutcomes();
+    Sequence seq = model.bestSequence(sentence, additionalContext, cg, sequenceValidator);
+    if (seq == null) {
+      return new String[sentence.length];
+    }
+    lastDecodedSequence.set(seq);
+    final List<String> t = seq.getOutcomes();
     return convertTags(t);
   }
 
@@ -237,26 +275,42 @@ public class POSTaggerME implements POSTagger, Probabilistic {
   }
 
   /**
-   * Populates the specified {@code probs} array with the probabilities
-   * for each tag of the last tagged sentence.
+   * Populates the specified {@code probs} array with the probabilities for each tag of the last tagged
+   * sentence.
    *
    * @param probs An array to put the probabilities into.
    */
   public void probs(double[] probs) {
-    bestSequence.getProbs(probs);
+    Sequence seq = lastDecodedSequence.get();
+    if (seq == null) {
+      throw new IllegalStateException("tag() must be called before probs() on each thread.");
+    }
+    seq.getProbs(probs);
   }
 
   /**
    * {@inheritDoc}
-   * 
+   *
    * The sequence was determined based on the previous call to {@link #tag(String[])}.
    *
-   * @return An array with the same number of probabilities as tokens were sent
-   *         to {@link #tag(String[])} when it was last called.
+   * @return an array with the same number of probabilities as tokens were sent to {@link #tag(String[])}
+   *     when it was last called
    */
   @Override
   public double[] probs() {
-    return bestSequence.getProbs();
+    Sequence seq = lastDecodedSequence.get();
+    if (seq == null) {
+      throw new IllegalStateException("tag() must be called before probs() on each thread.");
+    }
+    return seq.getProbs();
+  }
+
+  /**
+   * Removes thread-local state to prevent classloader leaks in container environments.
+   * Call when the thread is returned to a pool or the tagger is no longer needed.
+   */
+  public void clearThreadLocalState() {
+    lastDecodedSequence.clearForCurrentThread();
   }
 
   public String[] getOrderedTags(List<String> words, List<String> tags, int index) {
@@ -295,11 +349,11 @@ public class POSTaggerME implements POSTagger, Probabilistic {
   /**
    * Starts a training of a {@link POSModel} with the given parameters.
    *
-   * @param languageCode  The ISO language code to train the model. Must not be {@code null}.
-   * @param samples       The {@link ObjectStream} of {@link POSSample} used as input for training.
-   * @param mlParams      The {@link TrainingParameters} for the context of the training process.
-   * @param posFactory    The {@link POSTaggerFactory} for creating related objects as defined
-   *                      via {@code mlParams}.
+   * @param languageCode The ISO language code to train the model. Must not be {@code null}.
+   * @param samples      The {@link ObjectStream} of {@link POSSample} used as input for training.
+   * @param mlParams     The {@link TrainingParameters} for the context of the training process.
+   * @param posFactory   The {@link POSTaggerFactory} for creating related objects as defined via
+   *     {@code mlParams}.
    *
    * @return A valid, trained {@link POSModel} instance.
    * @throws IOException Thrown if IO errors occurred.

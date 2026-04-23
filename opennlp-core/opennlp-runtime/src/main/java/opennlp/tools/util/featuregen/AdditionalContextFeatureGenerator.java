@@ -19,20 +19,24 @@ package opennlp.tools.util.featuregen;
 
 import java.util.List;
 
+import opennlp.tools.commons.ThreadSafe;
 
 /**
  * The {@link AdditionalContextFeatureGenerator} generates the context from the passed
  * in additional context.
  */
+@ThreadSafe
 public class AdditionalContextFeatureGenerator implements AdaptiveFeatureGenerator {
 
   private static final String PREFIX = "ne=";
 
-  private String[][] additionalContext;
+  /** Per-thread additional context (same role as the former mutable instance field). */
+  private final ThreadLocal<String[][]> threadState = new ThreadLocal<>();
 
   @Override
   public void createFeatures(List<String> features, String[] tokens, int index, String[] preds) {
 
+    String[][] additionalContext = threadState.get();
     if (additionalContext != null && additionalContext.length != 0) {
       String[] context = additionalContext[index];
 
@@ -43,6 +47,18 @@ public class AdditionalContextFeatureGenerator implements AdaptiveFeatureGenerat
   }
 
   public void setCurrentContext(String[][] context) {
-    additionalContext = context;
+    threadState.set(context);
+  }
+
+  /**
+   * Releases the calling thread's per-thread context slot. Call when a worker thread is being returned
+   * to a pool, or when the enclosing component is being disposed in a container with classloader
+   * isolation, to avoid pinning the thread's context classloader via the {@link ThreadLocal} entry.
+   *
+   * <p>Same lifecycle contract as the {@code clearThreadLocalState()} methods on the ME classes that
+   * embed this generator (currently {@link opennlp.tools.namefind.NameFinderME}).</p>
+   */
+  public void clearForCurrentThread() {
+    threadState.remove();
   }
 }

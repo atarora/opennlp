@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import opennlp.tools.commons.ThreadSafe;
 import opennlp.tools.ml.AlgorithmType;
 import opennlp.tools.ml.BeamSearch;
 import opennlp.tools.ml.EventModelSequenceTrainer;
@@ -38,6 +39,7 @@ import opennlp.tools.ml.TrainerFactory.TrainerType;
 import opennlp.tools.ml.model.Event;
 import opennlp.tools.ml.model.MaxentModel;
 import opennlp.tools.ml.model.SequenceClassificationModel;
+import opennlp.tools.util.LastResultOwnerOrThreadLocal;
 import opennlp.tools.util.ObjectStream;
 import opennlp.tools.util.Parameters;
 import opennlp.tools.util.Sequence;
@@ -50,10 +52,17 @@ import opennlp.tools.util.featuregen.WindowFeatureGenerator;
 
 /**
  * A maximum-entropy-based {@link TokenNameFinder name finder} implementation.
+ * <p>
+ * A name finder instance is thread-safe. One instance can be shared across multiple threads to save memory.
+ * <p>
+ * <b>Note:</b> In container environments with classloader isolation (e.g. Jakarta EE), ensure instances do
+ * not outlive the application's lifecycle, as underlying components use {@link ThreadLocal} state that may
+ * pin the classloader.
  *
  * @see Probabilistic
  * @see TokenNameFinder
  */
+@ThreadSafe
 public class NameFinderME implements TokenNameFinder, Probabilistic {
 
   private static final String[][] EMPTY = new String[0][0];
@@ -69,15 +78,30 @@ public class NameFinderME implements TokenNameFinder, Probabilistic {
   protected final SequenceClassificationModel model;
 
   protected final NameContextGenerator contextGenerator;
-  private Sequence bestSequence;
 
+  /**
+   * Per-thread {@code bestSequence} for {@link #probs()} / {@link #probs(double[])} access. Uses the
+   * owner-fast-path helper so single-threaded short-lived instances don't allocate a {@link ThreadLocal}
+   * map entry; once a second thread touches the same instance, non-owner threads transition to
+   * {@link ThreadLocal} storage. Same pattern used by {@link opennlp.tools.postag.POSTaggerME} et al.
+   */
+  private final LastResultOwnerOrThreadLocal<Sequence> lastBestSequence =
+      new LastResultOwnerOrThreadLocal<>();
+
+  /**
+   * One shared additional-context feature generator per {@code NameFinderME} instance. The generator
+   * itself is {@code @ThreadSafe} and keeps the per-thread additional-context array via its own
+   * {@link ThreadLocal}, so we don't need a per-thread wrapper here (which would have been a redundant
+   * nested {@link ThreadLocal}).
+   */
   private final AdditionalContextFeatureGenerator additionalContextFeatureGenerator =
-          new AdditionalContextFeatureGenerator();
+      new AdditionalContextFeatureGenerator();
+
   private final SequenceValidator<String> sequenceValidator;
 
   /**
    * Initializes a {@link NameFinderME} with a {@link TokenNameFinderModel}.
-   * 
+   *
    * @param model The {@link TokenNameFinderModel} to initialize with.
    */
   public NameFinderME(TokenNameFinderModel model) {
@@ -91,7 +115,7 @@ public class NameFinderME implements TokenNameFinder, Probabilistic {
 
     // TODO: We should deprecate this. And come up with a better solution!
     contextGenerator.addFeatureGenerator(
-            new WindowFeatureGenerator(additionalContextFeatureGenerator, 8, 8));
+        new WindowFeatureGenerator(additionalContextFeatureGenerator, 8, 8));
   }
 
   @Override
@@ -100,21 +124,24 @@ public class NameFinderME implements TokenNameFinder, Probabilistic {
   }
 
   /**
-   * Generates name tags for the given sequence, typically a sentence, returning
-   * {@link Span token spans} for any identified names.
+   * Generates name tags for the given sequence, typically a sentence, returning {@link Span token spans}
+   * for any identified names.
    *
    * @param tokens An array of the tokens or words of a sequence, typically a sentence.
-   * @param additionalContext Features which are based on context outside of the
-   *                          sentence but which should also be used.
-   *
+   * @param additionalContext Features based on context outside of the sentence but which should also be used.
    * @return An array of {@link Span token spans} for each of the names identified.
    */
   public Span[] find(String[] tokens, String[][] additionalContext) {
 
     additionalContextFeatureGenerator.setCurrentContext(additionalContext);
-    bestSequence = model.bestSequence(tokens, additionalContext, contextGenerator, sequenceValidator);
+    Sequence seq = model.bestSequence(tokens,
+        additionalContext, contextGenerator, sequenceValidator);
+    if (seq == null) {
+      return new Span[0];
+    }
+    lastBestSequence.set(seq);
 
-    List<String> c = bestSequence.getOutcomes();
+    List<String> c = seq.getOutcomes();
 
     contextGenerator.updateAdaptiveData(tokens, c.toArray(new String[0]));
     Span[] spans = seqCodec.decode(c);
@@ -136,27 +163,34 @@ public class NameFinderME implements TokenNameFinder, Probabilistic {
    * @param probs An array with the probabilities of the last decoded sequence.
    */
   public void probs(double[] probs) {
-    bestSequence.getProbs(probs);
+    Sequence seq = lastBestSequence.get();
+    if (seq == null) {
+      throw new IllegalStateException("find() must be called before probs() on each thread.");
+    }
+    seq.getProbs(probs);
   }
 
   /**
    * {@inheritDoc}
-   * 
+   *
    * The sequence was determined based on the previous call to {@link #find(String[])}.
    *
-   * @return An array with the same number of probabilities as tokens were sent
-   *         to {@link #find(String[])} when it was last called.
+   * @return an array with the same number of probabilities as tokens were sent to {@link #find(String[])}
+   *     when it was last called
    */
   @Override
   public double[] probs() {
-    return bestSequence.getProbs();
+    Sequence seq = lastBestSequence.get();
+    if (seq == null) {
+      throw new IllegalStateException("find() must be called before probs() on each thread.");
+    }
+    return seq.getProbs();
   }
 
   /**
    * Sets probabilities for the spans.
    *
    * @param spans The {@link Span spans} to set probabilities.
-   *              
    * @return The {@link Span spans} with populated values.
    */
   private Span[] setProbs(Span[] spans) {
@@ -172,19 +206,20 @@ public class NameFinderME implements TokenNameFinder, Probabilistic {
   }
 
   /**
-   * Retrieves an array of probabilities for each of the specified spans which is
-   * the arithmetic mean of the probabilities for each of the outcomes which
-   * make up the span.
+   * Retrieves an array of probabilities for each of the specified spans which is the arithmetic mean of the
+   * probabilities for each of the outcomes which make up the span.
    *
-   * @param spans The {@link Span spans} of the names for which probabilities
-   *              are requested.
-   *
+   * @param spans The {@link Span spans} of the names for which probabilities are requested.
    * @return An array of probabilities for each of the specified spans.
    */
   public double[] probs(Span[] spans) {
 
     double[] sprobs = new double[spans.length];
-    double[] probs = bestSequence.getProbs();
+    Sequence seq = lastBestSequence.get();
+    if (seq == null) {
+      throw new IllegalStateException("find() must be called before probs() on each thread.");
+    }
+    double[] probs = seq.getProbs();
 
     for (int si = 0; si < spans.length; si++) {
 
@@ -203,14 +238,33 @@ public class NameFinderME implements TokenNameFinder, Probabilistic {
   }
 
   /**
+   * Releases the calling thread's per-thread state for this {@code NameFinderME} (the last decoded
+   * sequence stashed for {@link #probs()} access, plus the additional-context slot held by
+   * {@link AdditionalContextFeatureGenerator}).
+   *
+   * <p>This is intentionally a per-thread, not a per-instance, operation: a single
+   * {@code NameFinderME} is typically shared across many pool threads, and each one owns an
+   * independent slot. Call this when a worker thread is being returned to a pool, or when the name
+   * finder is being disposed in a container with classloader isolation.</p>
+   *
+   * <p>Note that this does <i>not</i> release per-thread state inside the underlying
+   * {@link opennlp.tools.ml.BeamSearch} cache or other feature generators in the pipeline; those
+   * live for the duration of the owning thread.</p>
+   */
+  public void clearThreadLocalState() {
+    lastBestSequence.clearForCurrentThread();
+    additionalContextFeatureGenerator.clearForCurrentThread();
+  }
+
+  /**
    * Starts a training of a {@link TokenNameFinderModel} with the given parameters.
    *
    * @param languageCode The ISO conform language code.
    * @param type The type to use.
    * @param samples The {@link ObjectStream} of {@link NameSample} used as input for training.
    * @param params The {@link TrainingParameters} for the context of the training.
-   * @param factory The {@link TokenNameFinderFactory} for creating related objects defined
-   *                via {@code params}.
+   * @param factory The {@link TokenNameFinderFactory} for creating related objects defined via
+   *     {@code params}.
    *
    * @return A valid, trained {@link TokenNameFinderModel} instance.
    * @throws IOException Thrown if IO errors occurred during training.

@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
 
+import opennlp.tools.commons.ThreadSafe;
 import opennlp.tools.dictionary.Dictionary;
 import opennlp.tools.ml.ArrayMath;
 import opennlp.tools.ml.EventTrainer;
@@ -34,6 +35,7 @@ import opennlp.tools.ml.model.MaxentModel;
 import opennlp.tools.models.ModelType;
 import opennlp.tools.util.DownloadUtil;
 import opennlp.tools.util.ObjectStream;
+import opennlp.tools.util.OwnerOrPerThreadState;
 import opennlp.tools.util.Span;
 import opennlp.tools.util.StringList;
 import opennlp.tools.util.TrainingParameters;
@@ -50,12 +52,14 @@ import opennlp.tools.util.TrainingParameters;
  * The {@link TokenizerModel} class encapsulates that model and provides
  * methods to create it from the binary representation.
  * <p>
- * A tokenizer instance is not thread-safe. For each thread, one tokenizer
- * must be instantiated which can share one {@link TokenizerModel} instance
- * to safe memory.
+ * A tokenizer instance is thread-safe. One tokenizer can be shared across multiple threads to save
+ * memory.
  * <p>
- * To train a new model, the {@link #train(ObjectStream, TokenizerFactory, TrainingParameters)} method
- * can be used.
+ * <b>Note:</b> In container environments with classloader isolation (e.g. Jakarta EE), ensure instances do
+ * not outlive the application's lifecycle, as underlying components use {@link ThreadLocal} state that may
+ * pin the classloader.
+ * <p>
+ * To train a new model, use {@link #train(ObjectStream, TokenizerFactory, TrainingParameters)}.
  * <p>
  * Sample usage:
  * <p>
@@ -76,6 +80,7 @@ import opennlp.tools.util.TrainingParameters;
  * @see TokenSample
  * @see Probabilistic
  */
+@ThreadSafe
 public class TokenizerME extends AbstractTokenizer implements Probabilistic {
 
   /**
@@ -105,13 +110,16 @@ public class TokenizerME extends AbstractTokenizer implements Probabilistic {
    */
   private final boolean useAlphaNumericOptimization;
 
-  /*
-   * List of probabilities for each token returned from a call to
-   * <code>tokenize</code> or <code>tokenizePos</code>.
-   */
-  private final List<Double> tokProbs;
+  private final OwnerOrPerThreadState<TokenizerState> perThreadState =
+      new OwnerOrPerThreadState<>(TokenizerState::new, s -> {
+        s.newTokens = new ArrayList<>();
+        s.tokProbs = new ArrayList<>();
+      });
 
-  private final List<Span> newTokens;
+  private static final class TokenizerState {
+    private List<Double> tokProbs = new ArrayList<>();
+    private List<Span> newTokens = new ArrayList<>();
+  }
 
   /*
    * The {@link Dictionary abbreviation dictionary} if available (may be {@code null}).
@@ -150,30 +158,24 @@ public class TokenizerME extends AbstractTokenizer implements Probabilistic {
     this.cg = factory.getContextGenerator();
     this.alphanumeric = factory.getAlphaNumericPattern();
     this.useAlphaNumericOptimization = factory.isUseAlphaNumericOptimization();
-
-    newTokens = new ArrayList<>();
-    tokProbs = new ArrayList<>(50);
   }
 
   /**
    * {@inheritDoc}
    *
-   *  The sequence was determined based on the previous call to {@link #tokenizePos(String)}.
+   * The sequence was determined based on the previous call to {@link #tokenizePos(String)}.
    *
-   * @return An array with the same number of probabilities as tokens were sent to
-   *         the computational method when {@link #tokenizePos(String)} was last called.
-   *         If not applicable an empty array is returned.
+   * @return an array with the same number of probabilities as tokens were sent to the computational method
+   *     when {@link #tokenizePos(String)} was last called; if not applicable, an empty array
    */
   @Override
   public double[] probs() {
-    return ArrayMath.toDoubleArray(tokProbs);
+    return ArrayMath.toDoubleArray(perThreadState.get().tokProbs);
   }
 
   /**
-   * @return the probabilities associated with the most recent calls to
-   *         {@link #tokenizePos(String)}.
-   *         If not applicable an empty array is returned.
-   *
+   * @return the probabilities associated with the most recent calls to {@link #tokenizePos(String)}; if not
+   *     applicable, an empty array
    * @deprecated Use {@link #probs()} instead.
    */
   @Deprecated(forRemoval = true, since = "2.5.5")
@@ -193,17 +195,17 @@ public class TokenizerME extends AbstractTokenizer implements Probabilistic {
     WhitespaceTokenizer whitespaceTokenizer = WhitespaceTokenizer.INSTANCE;
     whitespaceTokenizer.setKeepNewLines(keepNewLines);
     Span[] tokens = whitespaceTokenizer.tokenizePos(d);
-    newTokens.clear();
-    tokProbs.clear();
+    List<Span> localTokens = new ArrayList<>();
+    List<Double> localProbs = new ArrayList<>(50);
     for (Span s : tokens) {
       String tok = d.substring(s.getStart(), s.getEnd());
       // Can't tokenize single characters
       if (tok.length() < 2) {
-        newTokens.add(s);
-        tokProbs.add(1d);
+        localTokens.add(s);
+        localProbs.add(1d);
       } else if (useAlphaNumericOptimization() && alphanumeric.matcher(tok).matches()) {
-        newTokens.add(s);
-        tokProbs.add(1d);
+        localTokens.add(s);
+        localProbs.add(1d);
       } else {
         int start = s.getStart();
         int end = s.getEnd();
@@ -216,29 +218,42 @@ public class TokenizerME extends AbstractTokenizer implements Probabilistic {
           tokenProb *= probs[model.getIndex(best)];
           if (best.equals(TokenizerME.SPLIT)) {
             if (isAcceptableAbbreviation(tok)) {
-              newTokens.add(new Span(start, end));
-              tokProbs.add(tokenProb);
+              localTokens.add(new Span(start, end));
+              localProbs.add(tokenProb);
               long numberOfDots = tok.codePoints().filter(ch -> ch == '.').count();
               j = j + (int) numberOfDots; // To compensate for abbreviation dot(s)
               start = j + 1;
             } else {
-              newTokens.add(new Span(start, j));
-              tokProbs.add(tokenProb);
+              localTokens.add(new Span(start, j));
+              localProbs.add(tokenProb);
               start = j;
             }
             tokenProb = 1.0;
           }
         }
         if (start < end) {
-          newTokens.add(new Span(start, end));
-          tokProbs.add(tokenProb);
+          localTokens.add(new Span(start, end));
+          localProbs.add(tokenProb);
         }
       }
     }
 
-    Span[] spans = new Span[newTokens.size()];
-    newTokens.toArray(spans);
+    // Publish per-thread state for backward-compatible probs() access
+    TokenizerState state = perThreadState.get();
+    state.newTokens = localTokens;
+    state.tokProbs = localProbs;
+
+    Span[] spans = new Span[localTokens.size()];
+    localTokens.toArray(spans);
     return spans;
+  }
+
+  /**
+   * Removes thread-local state to prevent classloader leaks in container environments.
+   * Call when the thread is returned to a pool or the tokenizer is no longer needed.
+   */
+  public void clearThreadLocalState() {
+    perThreadState.clearForCurrentThread();
   }
 
   /**
@@ -248,8 +263,8 @@ public class TokenizerME extends AbstractTokenizer implements Probabilistic {
    * @param factory A {@link TokenizerFactory} to get resources from.
    * @param mlParams The machine learning {@link TrainingParameters train parameters}.
    * @return A trained {@link TokenizerModel}.
-   * @throws IOException Thrown during IO operations on a temp file which is created
-   *           during training. Or if reading from the {@link ObjectStream} fails.
+   * @throws IOException Thrown during IO on a temp file created during training, or if reading from the
+   *     {@link ObjectStream} fails.
    */
   public static TokenizerModel train(ObjectStream<TokenSample> samples, TokenizerFactory factory,
       TrainingParameters mlParams) throws IOException {

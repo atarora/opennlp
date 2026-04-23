@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import opennlp.tools.commons.ThreadSafe;
 import opennlp.tools.dictionary.Dictionary;
 import opennlp.tools.ml.ArrayMath;
 import opennlp.tools.ml.EventTrainer;
@@ -36,6 +37,7 @@ import opennlp.tools.models.ModelType;
 import opennlp.tools.sentdetect.lang.Factory;
 import opennlp.tools.util.DownloadUtil;
 import opennlp.tools.util.ObjectStream;
+import opennlp.tools.util.OwnerOrPerThreadState;
 import opennlp.tools.util.Span;
 import opennlp.tools.util.StringList;
 import opennlp.tools.util.StringUtil;
@@ -46,7 +48,15 @@ import opennlp.tools.util.TrainingParameters;
  * <p>
  * A maximum entropy model is used to evaluate end-of-sentence characters in a
  * string to determine if they signify the end of a sentence.
+ * <p>
+ * A sentence detector instance is thread-safe. One instance can be shared across multiple threads to save
+ * memory.
+ * <p>
+ * <b>Note:</b> In container environments with classloader isolation (e.g. Jakarta EE), ensure instances do
+ * not outlive the application's lifecycle, as underlying components use {@link ThreadLocal} state that may
+ * pin the classloader.
  */
+@ThreadSafe
 public class SentenceDetectorME implements SentenceDetector, Probabilistic {
 
   /**
@@ -74,10 +84,13 @@ public class SentenceDetectorME implements SentenceDetector, Probabilistic {
    */
   private final EndOfSentenceScanner scanner;
 
-  /**
-   * The list of probabilities associated with each decision.
-   */
-  private final List<Double> sentProbs = new ArrayList<>();
+  private static final class SentenceDetectorState {
+    private List<Double> sentProbs = new ArrayList<>();
+  }
+
+  private final OwnerOrPerThreadState<SentenceDetectorState> perThreadState =
+      new OwnerOrPerThreadState<>(SentenceDetectorState::new,
+          s -> s.sentProbs = new ArrayList<>());
 
   /**
    * The {@link Dictionary abbreviation dictionary} if available (may be {@code null}).
@@ -121,8 +134,7 @@ public class SentenceDetectorME implements SentenceDetector, Probabilistic {
   }
 
   /**
-   * @deprecated Use a {@link SentenceDetectorFactory} to extend
-   *             SentenceDetector functionality.
+   * @deprecated Use a {@link SentenceDetectorFactory} to extend SentenceDetector functionality.
    */
   @Deprecated
   public SentenceDetectorME(SentenceModel model, Factory factory) {
@@ -188,14 +200,13 @@ public class SentenceDetectorME implements SentenceDetector, Probabilistic {
   /**
    * Detects the position of the first words of sentences in a {@link CharSequence}.
    *
-   * @param s  The {@link CharSequence} to be processed.
-   * @return   An {@link Span span array} containing the positions of the end index of
-   *           every sentence.
-   *
+   * @param s The {@link CharSequence} to be processed.
+   * @return An {@link Span span array} containing the positions of the end index of every sentence.
    */
   @Override
   public Span[] sentPosDetect(CharSequence s) {
-    sentProbs.clear();
+    SentenceDetectorState state = perThreadState.get();
+    List<Double> localProbs = new ArrayList<>();
     List<Integer> enders = scanner.getPositions(s);
     List<Integer> positions = new ArrayList<>(enders.size());
 
@@ -225,7 +236,7 @@ public class SentenceDetectorME implements SentenceDetector, Probabilistic {
           else {
             positions.add(getFirstNonWS(s, cint + 1));
           }
-          sentProbs.add(probs[model.getIndex(bestOutcome)]);
+          localProbs.add(probs[model.getIndex(bestOutcome)]);
         }
 
         index = cint + 1;
@@ -248,11 +259,14 @@ public class SentenceDetectorME implements SentenceDetector, Probabilistic {
         end--;
 
       if (end - start > 0) {
-        sentProbs.add(1d);
+        localProbs.add(1d);
+        state.sentProbs = localProbs;
         return new Span[] {new Span(start, end)};
       }
-      else
+      else {
+        state.sentProbs = localProbs;
         return new Span[0];
+      }
     }
 
     // Convert the sentence end indexes to spans
@@ -277,7 +291,7 @@ public class SentenceDetectorME implements SentenceDetector, Probabilistic {
         spans[si] = span;
       }
       else {
-        sentProbs.remove(si);
+        localProbs.remove(si);
       }
     }
 
@@ -285,17 +299,20 @@ public class SentenceDetectorME implements SentenceDetector, Probabilistic {
       Span span = new Span(starts[starts.length - 1], s.length()).trim(s);
       if (span.length() > 0) {
         spans[spans.length - 1] = span;
-        sentProbs.add(1d);
+        localProbs.add(1d);
       }
     }
     /*
      * set the prob for each span
      */
     for (int i = 0; i < spans.length; i++) {
-      double prob = sentProbs.get(i);
+      double prob = localProbs.get(i);
       spans[i] = new Span(spans[i], prob);
 
     }
+
+    // Publish for backward-compatible probs() access (last-writer-wins under concurrency)
+    state.sentProbs = localProbs;
 
     return spans;
   }
@@ -303,24 +320,27 @@ public class SentenceDetectorME implements SentenceDetector, Probabilistic {
   /**
    * {@inheritDoc}
    *
-   * The sequence was determined based on the previous call to
-   * {@link #sentDetect(CharSequence)}.
+   * The sequence was determined based on the previous call to {@link #sentDetect(CharSequence)}.
    *
-   * @return An array with the same number of probabilities as tokens were sent to
-   *         {@link #sentDetect(CharSequence)} when it was last called.
-   *         If not applicable, an empty array is returned.
+   * @return an array with the same number of probabilities as for the last
+   *     {@link #sentDetect(CharSequence)} call; if not applicable, an empty array
    */
   @Override
   public double[] probs() {
-    return ArrayMath.toDoubleArray(sentProbs);
+    return ArrayMath.toDoubleArray(perThreadState.get().sentProbs);
   }
 
   /**
-   *
-   * @return The probability for each sentence returned for the most recent
-   *     call to {@link #sentDetect(CharSequence)}.
-   *     If not applicable, an empty array is returned.
-   *     
+   * Removes thread-local state to prevent classloader leaks in container environments.
+   * Call when the thread is returned to a pool or the sentence detector is no longer needed.
+   */
+  public void clearThreadLocalState() {
+    perThreadState.clearForCurrentThread();
+  }
+
+  /**
+   * @return The probability for each sentence returned for the most recent call to
+   *     {@link #sentDetect(CharSequence)}; if not applicable, an empty array
    * @deprecated Use {@link #probs()} instead.
    */
   @Deprecated(forRemoval = true, since = "2.5.5")
@@ -392,8 +412,8 @@ public class SentenceDetectorME implements SentenceDetector, Probabilistic {
    *
    * @param languageCode The ISO language code to train the model. Must not be {@code null}.
    * @param samples The {@link ObjectStream} of {@link SentenceSample} used as input for training.
-   * @param sdFactory The {@link SentenceDetectorFactory} for creating related objects as defined
-   *                  via {@code mlParams}.
+   * @param sdFactory The {@link SentenceDetectorFactory} for creating related objects as defined via
+   *     {@code mlParams}.
    * @param mlParams The {@link TrainingParameters} for the context of the training process.
    *
    * @return A valid, trained {@link SentenceModel} instance.
